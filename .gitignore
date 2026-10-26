@@ -4,5 +4,5 @@ __pycache__/
 output_expected.txt
 output_got.txt
 
-/mybash
-/test
+mybash
+test
