@@ -9,9 +9,10 @@
 #include <sys/wait.h>
 
 #include <pwd.h>
-#include <limits.h>
 
 #include <string.h>
+
+// python3 checker.py -e ./mybash --tests ./tests.txt --verbose 1
 
 static unsigned 
 get_count_command(const struct expr *head) 
@@ -33,13 +34,19 @@ cd_exec_command(const char* args)
 }
 
 static void
-exit_exec_command() 
+exit_exec_command(const struct command* cmd) 
 {
 	int code = 0;
+
+	if (cmd->arg_count != 0) 
+	{
+		code = atoi(cmd->args[0]);
+	}
+
 	exit(code);
 }
 
-static void
+static int
 execute_command_line(const struct command_line *line)
 {
 	assert(line != NULL);
@@ -49,9 +56,9 @@ execute_command_line(const struct command_line *line)
 	if (line->out_type == OUTPUT_TYPE_STDOUT) {
 		output_stream = STDOUT_FILENO;
 	} else if (line->out_type == OUTPUT_TYPE_FILE_NEW) {
-		output_stream = open(line->out_file, O_WRONLY|O_CREAT|O_TRUNC);
+		output_stream = open(line->out_file, O_WRONLY|O_CREAT|O_TRUNC, 0666);
 	} else if (line->out_type == OUTPUT_TYPE_FILE_APPEND) {
-		output_stream = open(line->out_file, O_WRONLY|O_APPEND);
+		output_stream = open(line->out_file, O_WRONLY|O_APPEND, 0666);
 	} else {
 		assert(false);
 	}
@@ -62,55 +69,106 @@ execute_command_line(const struct command_line *line)
 	pipe(&out_fds[0]);
 	size_t out_it = 0;
 
-	while (e != NULL) {
-		if (e->type == EXPR_TYPE_COMMAND) {
-			if (strcmp(e->cmd.exe, "cd") == 0)
+	bool pipe_flag = false;
+	bool has_pipe = false;
+
+	pid_t last_pid = -1;
+
+	while (e != NULL)
+	{
+		if (e->type == EXPR_TYPE_PIPE)
+		{
+			has_pipe = true;
+			break;
+		}
+		e = e->next;
+	}
+	
+	e = line->head;
+
+	while (e != NULL) 
+	{
+		if (e->type == EXPR_TYPE_COMMAND) 
+		{
+			
+			if (!pipe_flag && !has_pipe && strcmp(e->cmd.exe, "cd") == 0)
 			{
-				assert(e->cmd.arg_capacity != 0);
 				cd_exec_command(e->cmd.args[0]);
-			} else if (strcmp(e->cmd.exe, "exit") == 0) 
+			} 
+			else if (!pipe_flag && !has_pipe && strcmp(e->cmd.exe, "exit") == 0) 
 			{
-				exit_exec_command();
+				exit_exec_command(&e->cmd);
 			}
 			else
 			{
-				if (fork() == 0) 
+				pid_t pid = fork();
+				if (pid == 0) 
 				{
-					close(out_fds[out_it]);
-
-					dup2(out_fds[out_it + 1], STDOUT_FILENO);
-					close(out_fds[out_it + 1]);
-
-					size_t exec_argv = e->cmd.arg_capacity;
-					if (exec_argv == 0)
+					if (strcmp(e->cmd.exe, "cd") == 0)
 					{
-						++exec_argv;
-					}
-					char* exec_args[exec_argv + 1];
-					exec_args[0] = e->cmd.exe; 
-					for (size_t i = 0; i + 1 < e->cmd.arg_capacity; ++i)
+						cd_exec_command(e->cmd.args[0]);
+					} 
+					else if (strcmp(e->cmd.exe, "exit") == 0) 
 					{
-						exec_args[i + 1] = e->cmd.args[i];
+						exit_exec_command(&e->cmd);
 					}
-					exec_args[exec_argv] = NULL;
+					else 
+					{
+						if (pipe_flag)
+						{
+							assert(out_it >= 2);
+							dup2(out_fds[out_it - 2], STDIN_FILENO);
+							close(out_fds[out_it - 2]);
+						}
 
-					execvp(e->cmd.exe, exec_args);
+						close(out_fds[out_it]);
+						dup2(out_fds[out_it + 1], STDOUT_FILENO);
+						close(out_fds[out_it + 1]);
+
+						size_t exec_argv = e->cmd.arg_count;
+						char* exec_args[exec_argv + 2];
+						exec_args[0] = e->cmd.exe; 
+						for (size_t i = 0; i < e->cmd.arg_count; ++i)
+						{
+							exec_args[i + 1] = e->cmd.args[i];
+						}
+						exec_args[exec_argv + 1] = NULL;
+
+						execvp(e->cmd.exe, exec_args);
+						perror(e->cmd.exe); 
+						exit(127);
+					}
+				}
+				else if (pid > 0)
+				{
+					last_pid = pid;
 				}
 			}
-			
+
+			if (pipe_flag)
+			{
+				assert(out_it >= 2);
+				close(out_fds[out_it - 2]);
+				pipe_flag = false;
+			}
 			close(out_fds[out_it + 1]);
 			out_it += 2;
-		} else if (e->type == EXPR_TYPE_PIPE) {
-		
-			//pipe(&out_fds[out_it]);
-			//dup2(out_fds[out_it - 2], STDIN_FILENO); // тут ошибка, подтягивается родительский ввод
-			//close(out_fds[out_it - 2]);
-
-		} else if (e->type == EXPR_TYPE_AND) {
+		} 
+		else if (e->type == EXPR_TYPE_PIPE) 
+		{
+			pipe_flag = true;
+			pipe(&out_fds[out_it]);
+		} 
+		else if (e->type == EXPR_TYPE_AND) 
+		{
 			printf("\tAND\n");
-		} else if (e->type == EXPR_TYPE_OR) {
+		} 
+		else if (e->type == EXPR_TYPE_OR) 
+		{
 			printf("\tOR\n");
-		} else {
+		} 
+		else 
+		{
 			assert(false);
 		}
 		e = e->next;
@@ -128,9 +186,30 @@ execute_command_line(const struct command_line *line)
 	{
 		close(output_stream);
 	}
-	close(out_fds[out_it - 2]);
 
+	close(out_fds[out_it - 2]);
 	free(out_fds);
+
+	int status;
+	pid_t wait_pid = -1;
+	int last_exit_code = 0;
+
+	while ((wait_pid = wait(&status)) > 0) 
+	{
+		if (wait_pid == last_pid)
+		{
+			if (WIFEXITED(status)) 
+			{
+				last_exit_code = WEXITSTATUS(status);
+			} 
+			else if (WIFSIGNALED(status)) 
+			{
+				last_exit_code = 128 + WTERMSIG(status);
+			}	
+		}
+	}
+
+	return last_exit_code;
 }
 
 
@@ -138,28 +217,13 @@ execute_command_line(const struct command_line *line)
 int
 main(void)
 {
-	struct passwd *pw = getpwuid(getuid());
-    const char *username = pw ? pw->pw_name : "unknown";
-
-    char hostname[HOST_NAME_MAX + 1];
-    if (gethostname(hostname, sizeof(hostname)) != 0) {
-        perror("gethostname");
-        return 1;
-    }
-
-    char cwd[PATH_MAX];
-    if (getcwd(cwd, sizeof(cwd)) == NULL) {
-        perror("getcwd");
-        return 1;
-    }
-
 	const size_t buf_size = 1024;
 	char buf[buf_size];
 	int rc;
-	printf("%s@%s:%s$ ", username, hostname, cwd);
-	fflush(stdout);
 	struct parser *p = parser_new();
-	while ((rc = read(STDIN_FILENO, buf, buf_size)) > 0) {
+	int code = 0;
+	while ((rc = read(STDIN_FILENO, buf, buf_size)) > 0) 
+	{
 		parser_feed(p, buf, rc);
 		struct command_line *line = NULL;
 		while (true) 
@@ -171,16 +235,10 @@ main(void)
 				printf("Error: %d\n", (int)err);
 				continue;
 			}
-			execute_command_line(line);
+			code = execute_command_line(line);
 			command_line_delete(line);
 		}
-		if (getcwd(cwd, sizeof(cwd)) == NULL) {
-			perror("getcwd");
-			return 1;
-		}
-		printf("%s@%s:%s$ ", username, hostname, cwd);
-		fflush(stdout);
 	}
 	parser_delete(p);
-	return 0;
+	return code;
 }
