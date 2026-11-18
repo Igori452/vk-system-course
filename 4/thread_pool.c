@@ -3,8 +3,9 @@
 
 #include <stdlib.h>
 #include <string.h>
-
-#include <stdio.h>
+#include <time.h>
+#include <math.h>
+#include <errno.h>
 
 struct thread_task {
 	thread_task_f function;
@@ -23,6 +24,8 @@ struct thread_task {
 	bool is_finish;
 	/* Thread joined. */
 	bool is_join;
+	/* Task detached. */
+	bool is_detach;
 	/* Task result. */
 	void* result;
 };
@@ -47,6 +50,14 @@ struct thread_pool {
 	/* Deleting a pool. */
 	bool is_deleting;
 };
+
+static void
+clear_task(struct thread_task *task) 
+{
+	pthread_mutex_destroy(&(task->mutex));
+	pthread_cond_destroy(&(task->cond_finished));
+	free(task);
+}
 
 int
 thread_pool_new(int max_thread_count, struct thread_pool **pool)
@@ -156,12 +167,19 @@ worker(void* arg)
 		void* result_f = th_task->function(arg_f);
 
 		pthread_mutex_lock(&(th_task->mutex));
-		th_task->result = result_f;
-		th_task->is_finish = true;
-		th_task->is_running = false;
-		pthread_cond_signal(&(th_task->cond_finished));
-
-		pthread_mutex_unlock(&(th_task->mutex));
+		if (th_task->is_detach)
+		{	
+			pthread_mutex_unlock(&(th_task->mutex));
+			clear_task(th_task);
+		}
+		else 
+		{
+			th_task->result = result_f;
+			th_task->is_finish = true;
+			th_task->is_running = false;
+			pthread_cond_signal(&(th_task->cond_finished));
+			pthread_mutex_unlock(&(th_task->mutex));
+		}
 
 		pthread_mutex_lock(&(th_pool->mutex));
 		--(th_pool->tasks_count);
@@ -185,6 +203,7 @@ thread_pool_push_task(struct thread_pool *pool, struct thread_task *task)
 	task->is_pushed = true;
 	task->is_finish = false;
 	task->is_join = false;
+	task->is_detach = false;
 	pthread_mutex_unlock(&(task->mutex));
 
 	if (pool->tasks_head == NULL)
@@ -234,6 +253,7 @@ thread_task_new(struct thread_task **task, thread_task_f function, void *arg)
 	(*task)->is_running = false;
 	(*task)->is_pushed = false;
 	(*task)->is_join = false;
+	(*task)->is_detach = false;
 
 	pthread_mutex_init(&((*task)->mutex), NULL);
 	pthread_cond_init(&(*task)->cond_finished, NULL);
@@ -281,7 +301,6 @@ thread_task_join(struct thread_task *task, void **result)
 	pthread_mutex_unlock(&(task->mutex));
 
 	return 0;	
-
 }
 
 #if NEED_TIMED_JOIN
@@ -289,11 +308,49 @@ thread_task_join(struct thread_task *task, void **result)
 int
 thread_task_timed_join(struct thread_task *task, double timeout, void **result)
 {
-	/* IMPLEMENT THIS FUNCTION */
-	(void)task;
-	(void)timeout;
-	(void)result;
-	return TPOOL_ERR_NOT_IMPLEMENTED;
+	if (timeout <= 0.0)
+	{
+		return TPOOL_ERR_TIMEOUT;
+	}
+
+	pthread_mutex_lock(&(task->mutex));
+	if (!task->is_pushed)
+	{
+		pthread_mutex_unlock(&(task->mutex));
+		return TPOOL_ERR_TASK_NOT_PUSHED;
+	}
+
+	struct timespec ts;
+	clock_gettime(CLOCK_REALTIME, &ts);
+
+	double whole_sec;
+    double frac_sec = modf(timeout, &whole_sec);
+
+	ts.tv_sec += (time_t)whole_sec;
+	ts.tv_nsec += (long)(frac_sec * 1e9);
+
+	if (ts.tv_nsec >= 1000000000L)
+	{
+		ts.tv_nsec -= 1000000000L;
+		++(ts.tv_sec);
+	}
+
+	int rc = 0;
+	while (!task->is_finish)
+	{
+		rc = pthread_cond_timedwait(&(task->cond_finished), &(task->mutex), &ts);
+		if (rc == ETIMEDOUT)
+		{
+			pthread_mutex_unlock(&(task->mutex));
+			return TPOOL_ERR_TIMEOUT;
+		}
+	}
+
+	*result = task->result;
+	task->is_join = true;
+	pthread_mutex_unlock(&(task->mutex));
+
+	return 0;
 }
 
 #endif
@@ -321,9 +378,25 @@ thread_task_delete(struct thread_task *task)
 int
 thread_task_detach(struct thread_task *task)
 {
-	/* IMPLEMENT THIS FUNCTION */
-	(void)task;
-	return TPOOL_ERR_NOT_IMPLEMENTED;
+	pthread_mutex_lock(&(task->mutex));
+	if (!task->is_pushed)
+	{
+		pthread_mutex_unlock(&(task->mutex));
+		return TPOOL_ERR_TASK_NOT_PUSHED;
+	}
+
+	if (task->is_finish)
+	{
+		pthread_mutex_unlock(&(task->mutex));
+		clear_task(task);
+	}
+	else 
+	{
+		task->is_detach = true;
+		pthread_mutex_unlock(&(task->mutex));
+	}
+
+	return 0;
 }
 
 #endif
